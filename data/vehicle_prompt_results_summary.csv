@@ -1,0 +1,8 @@
+model,provider,avg_tokens_in,avg_tokens_out,total_tokens_in,total_tokens_out,cost_per_1000_prompts_usd,cost_in_total_usd,cost_out_total_usd,approx_tokens
+openai-gpt-4o,openai,37.56,465.6,939,11640,4.7499,0.0023474999999999998,0.1164,False
+openai-gpt-3.5,openai,37.56,183.12,939,4578,0.42258,0.0014085,0.009156000000000001,False
+claude-sonnet-3.7,claude,38.76,230.56,969,5764,3.57468,0.002907,0.08646,False
+claude-haiku-3,claude,38.76,342.84,969,8571,0.4382399999999999,0.00024225,0.01071375,False
+claude-sonnet-4.0,claude,38.76,314.2,969,7855,4.82928,0.002907,0.117825,False
+gemini,gemini,27.52,421.16,688,10529,2.1401999999999997,0.00086,0.052645,True
+ollama-llama3.2,ollama,27.52,339.44,688,8486,0.0,0.0,0.0,True
