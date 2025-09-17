@@ -1,9 +1,13 @@
 import os
 import sys
 from pathlib import Path
+import time
 try:
     import pandas as pd
     import logging
+    import json
+    import concurrent.futures
+    from collections import defaultdict
     from openai import OpenAI
 except ImportError as e:
     missing = str(e).split()[-1].strip("'\n")
@@ -21,11 +25,10 @@ from load_api_keys import load_keys
 # CONFIG (use repo-relative paths)
 # -------------------------
 SHEET_NAME = "Vehicle status quo"
-NUM_PROMPTS = 4080
 
 # Data files relative to repo root
-EXCEL_FILE = ROOT / "data" / "Prompt library.xlsx"
-OUTPUT_FILE = ROOT / "data" / "vehicle_prompt_results.csv"
+CSV_FILE = ROOT / "data" / "vehicle_prompt_results_deduped.csv"
+CSV_OUT = "/Users/aaryashah/Documents/GitHub/transformers_bert_llm_research/data/vehicle_prompt_results_classified.csv"
 
 # Load API keys (from environment or api_keys.txt)
 load_keys()
@@ -42,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 # -------------------------
-# Step 4: O3 classifier prompt and vehicle extraction
+# Step 4: GPT-4o classifier prompt and vehicle extraction
 # -------------------------
 
 # Improved LLM classifier prompt for robust vehicle classification
@@ -88,37 +91,12 @@ OUTPUT: Respond only with JSON in the required schema. Do not add explanations, 
 }
 """
 
-# Example vehicle type keywords (expand as needed)
-VEHICLE_TYPES = {
-    'EV': ['ev', 'electric'],
-    'PHEV': ['phev', 'plug-in hybrid'],
-    'HEV': ['hev', 'hybrid'],
-    'ICV': ['gasoline', 'petrol', 'gas', 'internal combustion', 'ice', 'conventional']
-}
-
-
-# --- Keyword-based classifier (existing logic) ---
-def classify_vehicles_keyword(response_text):
-    vehicles = set()
-    counts = {'EV': 0, 'PHEV': 0, 'HEV': 0, 'ICV': 0}
-    lines = response_text.lower().split('\n')
-    for line in lines:
-        for vtype, keywords in VEHICLE_TYPES.items():
-            if any(kw in line for kw in keywords):
-                counts[vtype] += 1
-        if any(kw in line for kws in VEHICLE_TYPES.values() for kw in kws):
-            vehicles.add(line.strip())
-    return vehicles, counts
-
-
-
 # --- LLM-based classifier using robust prompt (GPT-4o only) ---
-import json
-def classify_vehicles_llm_o3(response_text):
+def classify_vehicles_llm_gpt4o(response_text):
     prompt = f"{LLM_CLASSIFIER_PROMPT}\n\nRESPONSE TO CLASSIFY:\n{response_text}\n\nOUTPUT:"
     try:
         response = openai_client.chat.completions.create(
-            model="o3",
+            model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             response_format={"type": "json_object"}
@@ -129,21 +107,14 @@ def classify_vehicles_llm_o3(response_text):
         counts = parsed.get('counts', {"EV":0, "PHEV":0, "HEV":0, "ICV":0})
         return vehicles, counts, llm_response
     except Exception as e:
-        print(f"LLM classification error: {e}")
+        logger.error(f"LLM classification error: {e}")
         return set(), {"EV":0, "PHEV":0, "HEV":0, "ICV":0}, ""
 
-
-
-
-# Load the results CSV (responses to classify)
-results = pd.read_csv(OUTPUT_FILE)
-
-classified_rows = []
-for idx, r in results.iterrows():
-    prompt_id = r.get('prompt_id', None)
+def classify_row(row):
+    prompt_id = row.get('prompt_id', None)
+    response_text = row.get('response', '')
     try:
-        logger.info(f"Classifying row {idx+1}/{len(results)} (prompt_id={prompt_id})")
-        vehicles_llm, counts_llm, llm_raw = classify_vehicles_llm_o3(r.get('response', ''))
+        vehicles_llm, counts_llm, llm_raw = classify_vehicles_llm_gpt4o(response_text)
         vehicles_list = list(vehicles_llm)
         counts_list = [counts_llm.get('EV', 0), counts_llm.get('PHEV', 0), counts_llm.get('HEV', 0), counts_llm.get('ICV', 0)]
 
@@ -152,14 +123,14 @@ for idx, r in results.iterrows():
         print(summary)
         logger.info(f"Classified prompt_id={prompt_id}: EV={counts_list[0]} PHEV={counts_list[1]} HEV={counts_list[2]} ICV={counts_list[3]}")
 
-        classified_rows.append({
+        return {
             'prompt_id': prompt_id,
-            'provider': r.get('provider', None),
-            'model': r.get('model', None),
-            'tokens_in': r.get('tokens_in', None),
-            'tokens_out': r.get('tokens_out', None),
-            'approx_tokens': r.get('approx_tokens', None),
-            'response': r.get('response', None),
+            'provider': row.get('provider', None),
+            'model': row.get('model', None),
+            'tokens_in': row.get('tokens_in', None),
+            'tokens_out': row.get('tokens_out', None),
+            'approx_tokens': row.get('approx_tokens', None),
+            'response': response_text,
             'unique_vehicles_llm': '; '.join(vehicles_list),
             'num_unique_vehicles_llm': len(vehicles_list),
             'num_ev_llm': counts_list[0],
@@ -167,18 +138,17 @@ for idx, r in results.iterrows():
             'num_hev_llm': counts_list[2],
             'num_icv_llm': counts_list[3],
             'llm_classifier_raw': llm_raw
-        })
+        }
     except Exception as e:
-        logger.error(f"Error classifying row idx={idx} prompt_id={prompt_id}: {e}")
-        # append a row with empty/default classification so output lengths match
-        classified_rows.append({
+        logger.error(f"Error classifying row prompt_id={prompt_id}: {e}")
+        return {
             'prompt_id': prompt_id,
-            'provider': r.get('provider', None),
-            'model': r.get('model', None),
-            'tokens_in': r.get('tokens_in', None),
-            'tokens_out': r.get('tokens_out', None),
-            'approx_tokens': r.get('approx_tokens', None),
-            'response': r.get('response', None),
+            'provider': row.get('provider', None),
+            'model': row.get('model', None),
+            'tokens_in': row.get('tokens_in', None),
+            'tokens_out': row.get('tokens_out', None),
+            'approx_tokens': row.get('approx_tokens', None),
+            'response': response_text,
             'unique_vehicles_llm': '',
             'num_unique_vehicles_llm': 0,
             'num_ev_llm': 0,
@@ -186,24 +156,61 @@ for idx, r in results.iterrows():
             'num_hev_llm': 0,
             'num_icv_llm': 0,
             'llm_classifier_raw': ''
-        })
+        }
 
-classified_df = pd.DataFrame(classified_rows)
 
-CSV_OUT = "/Users/aaryashah/Documents/GitHub/transformers_bert_llm_research/data/vehicle_prompt_results_classified.csv"
 
-# Save to CSV, append if file exists (keep header only if creating new file)
+
+# Load the results from CSV (responses to classify)
+results = pd.read_csv(CSV_FILE)
+logger.info(f"Loaded {len(results)} rows from CSV. Columns: {list(results.columns)}")
+logger.info(f"First row sample: {results.iloc[0].to_dict() if len(results) > 0 else 'No rows'}")
+
+# Check for existing classified results to resume
+existing_prompt_ids = set()
+prompt_instance_count = defaultdict(int)
 if os.path.exists(CSV_OUT):
     try:
-        classified_df.to_csv(CSV_OUT, mode='a', header=False, index=False)
-        logger.info(f"Appended {len(classified_df)} rows to {CSV_OUT}")
+        existing_df = pd.read_csv(CSV_OUT)
+        existing_prompt_ids = set(existing_df['prompt_id'].dropna())
+        # Count existing instances per prompt_id
+        for pid in existing_df['prompt_id'].dropna():
+            prompt_instance_count[pid] += 1
+        logger.info(f"Found {len(existing_prompt_ids)} already classified prompt_ids, will skip them")
     except Exception as e:
-        logger.error(f"Failed appending to CSV {CSV_OUT}: {e}")
-else:
-    try:
-        classified_df.to_csv(CSV_OUT, mode='w', header=True, index=False)
-        logger.info(f"Wrote {len(classified_df)} rows to new CSV {CSV_OUT}")
-    except Exception as e:
-        logger.error(f"Failed writing CSV {CSV_OUT}: {e}")
+        logger.warning(f"Could not read existing CSV for resume: {e}")
 
-print(f"Saved classified vehicle results to {CSV_OUT}")
+# Filter to unclassified rows
+results = results[~results['prompt_id'].isin(existing_prompt_ids)]
+logger.info(f"Remaining rows to classify: {len(results)}")
+
+from collections import defaultdict
+
+# ... existing code ...
+
+classified_rows = []
+processed_count = 0
+with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    futures = [executor.submit(classify_row, row) for _, row in results.iterrows()]
+    for future in concurrent.futures.as_completed(futures):
+        result = future.result()
+        classified_rows.append(result)
+        processed_count += 1
+        prompt_id = result['prompt_id']
+        prompt_instance_count[prompt_id] += 1
+        
+        # Log progress with instance
+        logger.info(f"Processed {processed_count}/{len(results)} rows (prompt {prompt_id}, instance {prompt_instance_count[prompt_id]})")
+        
+        # Save this result immediately to CSV
+        single_df = pd.DataFrame([result])
+        if os.path.exists(CSV_OUT):
+            single_df.to_csv(CSV_OUT, mode='a', header=False, index=False)
+        else:
+            single_df.to_csv(CSV_OUT, mode='w', header=True, index=False)
+        
+        time.sleep(0.1)  # Small delay to avoid rate limits
+
+logger.info(f"Classification completed for {len(classified_rows)} rows")
+
+print(f"Saved classified vehicle results continuously to {CSV_OUT}")
